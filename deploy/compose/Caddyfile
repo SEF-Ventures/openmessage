@@ -1,0 +1,22 @@
+# MCP gateway: passes /mcp to OpenMessage and refuses everything else (/api, the web inbox, sign-in).
+# The caller brings its own "Authorization: Bearer <mcp token>"; the gateway holds no secret.
+# OpenMessage only answers loopback Host headers, so the gateway presents one and drops Origin.
+{
+	auto_https off
+	admin off
+}
+
+:7008 {
+	@mcp path /mcp
+	handle @mcp {
+		reverse_proxy openmessage:7007 {
+			header_up Host 127.0.0.1:7007
+			header_up -Origin
+			header_up -Referer
+			header_up -Cookie
+		}
+	}
+	handle {
+		respond 404
+	}
+}

@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+"""Export OpenMessage's SQLite archive to Corpus Sync's gmessages JSONL schema and report its health.
+
+The OpenMessage twin of corpus-sync's ops/linux/gmcli-export: the same output files and fields
+(schema_version 1), so Corpus Sync's gmessages adapter needs no change. Only Google Messages rows
+(source_platform 'sms' or empty) are exported; imported WhatsApp, Signal or iMessage rows are skipped.
+
+Reads   $OM_DATA_DIR/messages.db (read-only; the openmessage container owns it) and
+        $OM_DATA_DIR/mcp.token, used only to call the read-only get_status tool for health.
+Writes  $OM_EXPORT_DIR/{messages,conversations,drafts}.jsonl and state.json, each replaced atomically.
+        drafts.jsonl lists drafts waiting for Shane in the OpenMessage inbox (no bodies), so a
+        routine can remind him; the corpus adapter ignores it.
+Health  state.json "problem" is one of: unpaired, session_invalid, sync_down (OpenMessage not
+        answering or not connected for 15 min), or null. Corpus Sync turns it into CollectorDown.
+Media   With --media, saves recent attachments through the read-only download_media tool into
+        OPENMESSAGES_EXPORT_DIR inside the container, which is bind-mounted at $OM_MEDIA_DIR.
+
+Never prints message bodies, phone numbers or tokens. Exits 0 unless the export itself fails.
+"""
+import argparse
+import json
+import os
+import sqlite3
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+DATA = Path(os.environ.get("OM_DATA_DIR", "/var/lib/openmessage/data"))
+OUT = Path(os.environ.get("OM_EXPORT_DIR", "/var/lib/om-export/gmessages-gmcli/data"))
+MEDIA = Path(os.environ.get("OM_MEDIA_DIR", "/var/lib/om-export/gmessages-gmcli/media"))
+MCP_URL = os.environ.get("OM_MCP_URL", "http://127.0.0.1:7007/mcp")
+SYNC_DOWN_MS = 15 * 60 * 1000
+GOOGLE_PLATFORMS = ("sms", "")
+EXT_BY_MIME = {
+    "image/jpeg": "jpg", "image/png": "png", "image/gif": "gif", "image/webp": "webp",
+    "image/heic": "heic", "video/mp4": "mp4", "video/3gpp": "3gp", "application/pdf": "pdf",
+}
+
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+def ms(v):
+    """OpenMessage stores ms; guard against second or microsecond values."""
+    v = int(v or 0)
+    if 0 < v < 10**11:
+        return v * 1000
+    if v > 10**14:
+        return v // 1000
+    return v
+
+
+def atomic_write(path: Path, lines):
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8", newline="\n") as f:
+        for obj in lines:
+            f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    os.replace(tmp, path)
+
+
+def export(con, out: Path):
+    placeholders = ",".join("?" for _ in GOOGLE_PLATFORMS)
+    msgs = []
+    for mid, cid, name, number, body, ts, from_me, media_id, mime in con.execute(
+            "SELECT message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, is_from_me, "
+            "media_id, mime_type FROM messages WHERE COALESCE(source_platform, '') IN (" + placeholders + ") "
+            "ORDER BY timestamp_ms", GOOGLE_PLATFORMS):
+        out_dir = bool(from_me)
+        has_media = bool(media_id) or bool(mime and not mime.lower().startswith("text/"))
+        msgs.append({
+            "schema_version": 1, "source": "openmessage", "message_id": mid, "conversation_id": cid,
+            "timestamp_ms": ms(ts), "direction": "outbound" if out_dir else "inbound",
+            "sender_name": "Me" if out_dir else (name or ""), "sender_number": "" if out_dir else (number or ""),
+            "body": body or "", "has_media": has_media,
+            "media": [{"mime_type": mime or ""}] if has_media else [],
+        })
+    convs = [{"conversation_id": r[0], "name": r[1] or "", "is_group": bool(r[2]), "last_message_ms": ms(r[3])}
+             for r in con.execute(
+                 "SELECT conversation_id, name, is_group, last_message_ts FROM conversations "
+                 "WHERE COALESCE(source_platform, '') IN (" + placeholders + ")", GOOGLE_PLATFORMS)]
+    names = {c["conversation_id"]: c["name"] for c in convs}
+    drafts = [{"draft_id": r[0], "conversation_id": r[1], "conversation_name": names.get(r[1], ""),
+               "created_ms": ms(r[2])}
+              for r in con.execute("SELECT draft_id, conversation_id, created_at FROM drafts ORDER BY created_at")]
+    atomic_write(out / "messages.jsonl", msgs)
+    atomic_write(out / "conversations.jsonl", convs)
+    atomic_write(out / "drafts.jsonl", drafts)
+    return len(msgs), len(convs), len(drafts), max((m["timestamp_ms"] for m in msgs), default=0)
+
+
+class MCP:
+    """Minimal streamable-HTTP MCP client for OpenMessage's read-only tools."""
+
+    def __init__(self, url, token, timeout=20):
+        self.url, self.token, self.timeout, self.session, self.next_id = url, token, timeout, None, 1
+
+    def _post(self, payload):
+        headers = {"Authorization": "Bearer " + self.token, "Content-Type": "application/json",
+                   "Accept": "application/json, text/event-stream"}
+        if self.session:
+            headers["Mcp-Session-Id"] = self.session
+        req = urllib.request.Request(self.url, data=json.dumps(payload).encode(), headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            self.session = resp.headers.get("Mcp-Session-Id") or self.session
+            raw = resp.read().decode("utf-8", "replace")
+        if not raw.strip():
+            return None
+        if raw.lstrip().startswith("{"):
+            return json.loads(raw)
+        for line in raw.splitlines():  # SSE framing
+            if line.startswith("data:"):
+                return json.loads(line[5:].strip())
+        return None
+
+    def rpc(self, method, params=None):
+        msg = {"jsonrpc": "2.0", "id": self.next_id, "method": method, "params": params or {}}
+        self.next_id += 1
+        resp = self._post(msg)
+        if not resp or "error" in resp:
+            raise RuntimeError(f"{method} failed")
+        return resp["result"]
+
+    def open(self):
+        self.rpc("initialize", {"protocolVersion": "2025-03-26", "capabilities": {},
+                                "clientInfo": {"name": "om-export", "version": "1"}})
+        self._post({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        return self
+
+    def tool(self, name, arguments=None):
+        return self.rpc("tools/call", {"name": name, "arguments": arguments or {}})
+
+
+def health(client):
+    try:
+        status = client.tool("get_status").get("structuredContent") or {}
+    except (OSError, urllib.error.URLError, RuntimeError, ValueError):
+        return {"problem": "sync_down", "connected": False}
+    g = status.get("google") or {}
+    if not g.get("paired"):
+        return {"problem": "unpaired", "connected": False}
+    if g.get("needs_pairing"):
+        return {"problem": "session_invalid", "session_invalid": True, "connected": False}
+    if not g.get("connected"):
+        return {"problem": "disconnected", "connected": False, "phone_responding": bool(g.get("phone_responding"))}
+    return {"problem": None, "connected": True, "phone_responding": bool(g.get("phone_responding"))}
+
+
+def settle(state, h, prev):
+    """Report a disconnect as sync_down only once it has lasted SYNC_DOWN_MS."""
+    t = state["checked_ms"]
+    if h["problem"] is None:
+        state.update(h, last_connect_ms=t)
+        return state
+    last = int(prev.get("last_connect_ms") or 0)
+    if h["problem"] == "disconnected":
+        if last and t - last <= SYNC_DOWN_MS:
+            state.update(h, problem=None, last_connect_ms=last)
+        else:
+            state.update(h, problem="sync_down", last_connect_ms=last)
+        return state
+    state.update(h, last_connect_ms=last)
+    return state
+
+
+def fetch_media(con, client, media_dir: Path, days=14, max_downloads=20):
+    cutoff = now_ms() - days * 86400 * 1000
+    saved = 0
+    rows = con.execute(
+        "SELECT message_id, mime_type FROM messages WHERE media_id IS NOT NULL AND media_id != '' "
+        "AND COALESCE(source_platform, '') IN ('sms', '') AND timestamp_ms >= ? ORDER BY timestamp_ms DESC",
+        (cutoff,)).fetchall()
+    for mid, mime in rows:
+        if saved >= max_downloads:
+            break
+        if not mid or not all(ch.isalnum() or ch in "-_." for ch in str(mid)):
+            continue
+        ext = EXT_BY_MIME.get((mime or "").lower())
+        if not ext:
+            continue
+        name = f"{mid}.{ext}"
+        if (media_dir / name).exists():
+            continue
+        try:
+            client.tool("download_media", {"message_id": mid, "save": True, "output_path": name})
+            # OpenMessage saves private (0600) files; the corpus media worker reads them via group corpus.
+            if (media_dir / name).exists():
+                os.chmod(media_dir / name, 0o640)
+            saved += 1
+        except (OSError, urllib.error.URLError, RuntimeError, ValueError):
+            continue
+    return saved
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--media", action="store_true", help="also save recent attachments for the media pipeline")
+    args = ap.parse_args(argv)
+    OUT.mkdir(parents=True, exist_ok=True)
+    try:
+        prev = json.loads((OUT / "state.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        prev = {}
+    state = {"source": "openmessage", "checked_ms": now_ms(), "problem": None, "session_invalid": False}
+    db = DATA / "messages.db"
+    token_path = DATA / "mcp.token"
+    if not db.exists():
+        state.update(problem="unpaired", connected=False)
+        n = (0, 0, 0, 0)
+        client = None
+    else:
+        con = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True, timeout=10)
+        try:
+            n = export(con, OUT)
+            client = None
+            try:
+                client = MCP(MCP_URL, token_path.read_text(encoding="utf-8").strip()).open()
+            except (OSError, urllib.error.URLError, RuntimeError, ValueError):
+                client = None
+            h = health(client) if client else {"problem": "sync_down", "connected": False}
+            settle(state, h, prev)
+            if args.media and client and state["problem"] is None:
+                state["media_saved"] = fetch_media(con, client, MEDIA)
+        finally:
+            con.close()
+    state.update(messages=n[0], conversations=n[1], drafts_waiting=n[2], newest_message_ms=n[3])
+    tmp = OUT / "state.json.tmp"
+    tmp.write_text(json.dumps(state, indent=1), encoding="utf-8")
+    os.replace(tmp, OUT / "state.json")
+    print(f"om-export: problem={state['problem']} messages={n[0]} conversations={n[1]} drafts_waiting={n[2]}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

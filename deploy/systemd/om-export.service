@@ -1,0 +1,24 @@
+[Unit]
+Description=OpenMessage export for Corpus Sync gmessages (messages.jsonl, conversations.jsonl, state.json)
+Documentation=file:///opt/openmessage/RUNBOOK.md
+After=docker.service
+
+[Service]
+Type=oneshot
+User=openmessage
+Group=corpus
+UMask=0027
+ExecStart=/opt/openmessage/bin/om-export --media
+Environment=OM_DATA_DIR=/var/lib/openmessage/data
+Environment=OM_EXPORT_DIR=/var/lib/om-export/gmessages-gmcli/data
+Environment=OM_MEDIA_DIR=/var/lib/om-export/gmessages-gmcli/media
+Environment=OM_MCP_URL=http://127.0.0.1:7007/mcp
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadOnlyPaths=/var/lib/openmessage/data
+ReadWritePaths=/var/lib/om-export
+IPAddressAllow=localhost
+IPAddressDeny=any
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX

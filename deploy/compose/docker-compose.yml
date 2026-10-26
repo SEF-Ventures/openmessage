@@ -1,0 +1,75 @@
+# OpenMessage on one-hel1: Google Messages capture, Shane's texts inbox, and a read and draft only MCP.
+# Lives at /opt/openmessage/compose.yml with the fork checked out at /opt/openmessage/src (pinned commit).
+#
+#   Pair (phone needed):   docker compose run --rm openmessage pair        (QR in the terminal)
+#   Start:                 docker compose up -d openmessage
+#   Agent gateway (later): docker compose --profile agent-gateway up -d mcp-gateway
+#
+# Nothing listens beyond 127.0.0.1. Shane reaches the inbox through an SSH tunnel; om-export and
+# on-box agents reach /mcp with the MCP-only token. The fork's OPENMESSAGES_MCP_READ_ONLY drops every
+# send, react, import and transcript tool from MCP, and OPENMESSAGES_REQUIRE_TOKEN rejects any /api
+# or /mcp call without a token. Only the web inbox, signed in with Shane's cookie, can send.
+
+name: openmessage
+
+services:
+  openmessage:
+    build:
+      context: ./src            # SEF-Ventures/openmessage at the pinned commit (see RUNBOOK.md)
+      args:
+        VERSION: sef-read-draft-only
+    image: openmessage:sef
+    user: "10010:10010"         # host user 'openmessage'; om-export runs as the same uid
+    command: ["serve", "--web", "--mcp-sse"]
+    environment:
+      OPENMESSAGES_DATA_DIR: /data
+      OPENMESSAGES_HOST: 0.0.0.0
+      OPENMESSAGES_PORT: "7007"
+      OPENMESSAGES_MCP_READ_ONLY: "1"
+      OPENMESSAGES_REQUIRE_TOKEN: "1"
+      OPENMESSAGES_EXPORT_DIR: /export
+      OPENMESSAGES_MY_NAME: Me
+      OPENMESSAGE_TELEMETRY: "0"
+      OPENMESSAGES_GOOGLE_AVATAR_SYNC: "0"
+      OPENMESSAGES_LOG_LEVEL: info
+      HOME: /data
+    ports:
+      - "127.0.0.1:7007:7007"
+    volumes:
+      - /var/lib/openmessage/data:/data
+      - /var/lib/om-export/gmessages-gmcli/media:/export
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- --header \"Authorization: Bearer $$(cat /data/control.token)\" http://127.0.0.1:7007/api/status >/dev/null"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: journald
+      options:
+        tag: openmessage
+
+  # Off by default. Forwards only /mcp, so a remote agent with the MCP token reaches read and draft
+  # tools and nothing else. How it is exposed (Cloudflare tunnel or Tailscale) is decided at deploy.
+  mcp-gateway:
+    profiles: ["agent-gateway"]
+    image: caddy:2.10-alpine
+    depends_on: [openmessage]
+    ports:
+      - "127.0.0.1:7008:7008"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    read_only: true
+    tmpfs:
+      - /data
+      - /config
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]   # the caddy binary carries this file capability; exec fails without it
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped

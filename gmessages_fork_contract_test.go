@@ -18,7 +18,7 @@ import (
 
 const (
 	gmessagesModule            = "go.mau.fi/mautrix-gmessages"
-	gmessagesFork              = "github.com/MaxGhenis/gmessages"
+	gmessagesFork              = "github.com/SEF-Ventures/gmessages" // same commit as MaxGhenis/gmessages, kept under SEF-Ventures
 	minimumGMessagesFork       = "v0.2602.1-0.20261021163109-6495a585293d"
 	minimumGMessagesForkTime   = "20261021163109"
 	gmessagesAuthRetryContract = "libgm/longpoll auth-refresh network retry, payload-less response rejection and request timeout"

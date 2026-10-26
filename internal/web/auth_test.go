@@ -227,3 +227,79 @@ func TestEventStreamRejectsNewestSubscriberAtLimit(t *testing.T) {
 		t.Fatalf("status = %d, want 503", w.Code)
 	}
 }
+
+func TestEnforceRejectsMissingTokenAndScopesMCPToken(t *testing.T) {
+	t.Setenv("OPENMESSAGES_REQUIRE_TOKEN", "1")
+	dir := t.TempDir()
+	auth, err := NewControlAuth(dir, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if auth.mcpToken == "" || auth.mcpToken == auth.token {
+		t.Fatal("mcp token must exist and differ from the control token")
+	}
+	h := auth.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }))
+	cases := []struct {
+		path, bearer string
+		want         int
+	}{
+		{"/api/send", "", http.StatusUnauthorized},
+		{"/api/send", auth.mcpToken, http.StatusUnauthorized},
+		{"/api/send", auth.token, http.StatusOK},
+		{"/mcp", "", http.StatusUnauthorized},
+		{"/mcp", auth.mcpToken, http.StatusOK},
+		{"/mcp/message", auth.mcpToken, http.StatusOK},
+		{"/mcp", auth.token, http.StatusOK},
+		{"/", "", http.StatusOK},
+	}
+	for _, c := range cases {
+		req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:7007"+c.path, nil)
+		if c.bearer != "" {
+			req.Header.Set("Authorization", "Bearer "+c.bearer)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != c.want {
+			t.Errorf("%s with bearer=%t: got %d, want %d", c.path, c.bearer != "", rec.Code, c.want)
+		}
+	}
+}
+
+func TestBootstrapIsRecordedAndRemintedAfterUse(t *testing.T) {
+	dir := t.TempDir()
+	auth, err := NewControlAuth(dir, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	read := func() string {
+		b, err := os.ReadFile(filepath.Join(dir, BootstrapCodeFile))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.TrimSpace(string(b))
+	}
+	first := read()
+	if first != auth.bootstrap {
+		t.Fatal("bootstrap file does not match the live code")
+	}
+	h := auth.Handler(http.NotFoundHandler())
+	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:7007/auth/bootstrap?t="+first, nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusFound {
+		t.Fatalf("bootstrap status = %d", rec.Code)
+	}
+	cookies := rec.Result().Cookies()
+	if len(cookies) != 1 || cookies[0].MaxAge <= 0 {
+		t.Fatal("bootstrap cookie should persist across browser restarts")
+	}
+	second := read()
+	if second == "" || second == first {
+		t.Fatal("bootstrap code was not reminted after use")
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://127.0.0.1:7007/auth/bootstrap?t="+first, nil))
+	if rec.Code != http.StatusGone {
+		t.Fatalf("reused code status = %d, want 410", rec.Code)
+	}
+}

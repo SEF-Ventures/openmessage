@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/rs/zerolog"
 )
@@ -21,10 +22,31 @@ const (
 	ControlCookieName    = "om_control"
 	AuthModeAcceptAndLog = "accept-and-log"
 	maxWarnedRemotes     = 1024
+
+	// MCPTokenFile holds a second token that opens /mcp and nothing else, so
+	// an agent's credential can't reach /api (where the web UI sends).
+	MCPTokenFile = "mcp.token"
+	// BootstrapCodeFile holds the current single-use web sign-in code, so a
+	// headless host can hand its owner a sign-in link without reading logs.
+	BootstrapCodeFile = "bootstrap.code"
+	AuthModeEnforce   = "enforce"
+	controlCookieAge  = 30 * 24 * time.Hour
 )
+
+// enforceFromEnv reports whether OPENMESSAGES_REQUIRE_TOKEN asks for
+// protected paths to reject requests without a valid token.
+func enforceFromEnv() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("OPENMESSAGES_REQUIRE_TOKEN"))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
 
 type ControlAuth struct {
 	token             string
+	mcpToken          string
+	enforce           bool
 	bootstrap         string
 	logger            zerolog.Logger
 	dataDir           string
@@ -47,18 +69,40 @@ func NewControlAuth(dataDir string, logger zerolog.Logger) (*ControlAuth, error)
 		// acceptable: a corrupt token cannot authenticate them anyway.
 		logger.Warn().Str("path", filepath.Join(absDataDir, ControlTokenFile)).Msg("Invalid control token was regenerated")
 	}
+	mcpToken, _, err := loadOrMintTokenFile(absDataDir, MCPTokenFile)
+	if err != nil {
+		return nil, err
+	}
+	a := &ControlAuth{token: token, mcpToken: mcpToken, enforce: enforceFromEnv(), logger: logger, dataDir: absDataDir, warned: make(map[string]struct{})}
+	if err := a.mintBootstrap(); err != nil {
+		return nil, err
+	}
+	return a, nil
+}
+
+// mintBootstrap replaces the single-use sign-in code and records it in
+// BootstrapCodeFile (0600). Callers hold a.mu or own a not yet shared a.
+func (a *ControlAuth) mintBootstrap() error {
 	bootstrap, err := randomHex(32)
 	if err != nil {
-		return nil, fmt.Errorf("mint bootstrap code: %w", err)
+		return fmt.Errorf("mint bootstrap code: %w", err)
 	}
-	return &ControlAuth{token: token, bootstrap: bootstrap, logger: logger, dataDir: absDataDir, warned: make(map[string]struct{})}, nil
+	if err := writePrivateFile(filepath.Join(a.dataDir, BootstrapCodeFile), bootstrap); err != nil {
+		return fmt.Errorf("record bootstrap code: %w", err)
+	}
+	a.bootstrap = bootstrap
+	return nil
 }
 
 func loadOrMintControlToken(dataDir string) (string, bool, error) {
+	return loadOrMintTokenFile(dataDir, ControlTokenFile)
+}
+
+func loadOrMintTokenFile(dataDir, name string) (string, bool, error) {
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		return "", false, fmt.Errorf("create data directory: %w", err)
 	}
-	path := filepath.Join(dataDir, ControlTokenFile)
+	path := filepath.Join(dataDir, name)
 	b, err := os.ReadFile(path)
 	if err == nil {
 		token := strings.TrimSpace(string(b))
@@ -87,27 +131,35 @@ func mintControlToken(path string) (token string, err error) {
 	if err != nil {
 		return "", fmt.Errorf("mint control token: %w", err)
 	}
-	f, err := os.CreateTemp(filepath.Dir(path), ".control.token-*")
+	if err = writePrivateFile(path, token); err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
+// writePrivateFile atomically replaces path with value and a newline, 0600.
+func writePrivateFile(path, value string) (err error) {
+	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+"-*")
 	if err != nil {
-		return "", fmt.Errorf("create temporary control token: %w", err)
+		return fmt.Errorf("create temporary control token: %w", err)
 	}
 	tempPath := f.Name()
 	defer func() { _ = os.Remove(tempPath) }()
 	if err = f.Chmod(0o600); err != nil {
 		_ = f.Close()
-		return "", fmt.Errorf("secure temporary control token: %w", err)
+		return fmt.Errorf("secure temporary control token: %w", err)
 	}
-	if _, err = f.WriteString(token + "\n"); err != nil {
+	if _, err = f.WriteString(value + "\n"); err != nil {
 		_ = f.Close()
-		return "", fmt.Errorf("write temporary control token: %w", err)
+		return fmt.Errorf("write temporary control token: %w", err)
 	}
 	if err = f.Close(); err != nil {
-		return "", fmt.Errorf("close temporary control token: %w", err)
+		return fmt.Errorf("close temporary control token: %w", err)
 	}
 	if err = os.Rename(tempPath, path); err != nil {
-		return "", fmt.Errorf("install control token: %w", err)
+		return fmt.Errorf("install control token: %w", err)
 	}
-	return token, nil
+	return nil
 }
 
 func randomHex(bytes int) (string, error) {
@@ -140,7 +192,12 @@ func (a *ControlAuth) Handler(next http.Handler) http.Handler {
 		if isProtectedLocalPath(r.URL.Path) {
 			classification := a.classify(r)
 			fetchSite := strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))
-			if classification == "missing" || classification == "invalid" || (fetchSite != "" && fetchSite != "same-origin" && fetchSite != "same-site" && fetchSite != "none") {
+			crossSite := fetchSite != "" && fetchSite != "same-origin" && fetchSite != "same-site" && fetchSite != "none"
+			if classification == "missing" || classification == "invalid" || crossSite {
+				if a.enforce {
+					httpError(w, "unauthorized", http.StatusUnauthorized)
+					return
+				}
 				a.warnOnce(r, classification, fetchSite)
 			}
 		}
@@ -152,8 +209,13 @@ func (a *ControlAuth) classify(r *http.Request) string {
 	auth := strings.TrimSpace(r.Header.Get("Authorization"))
 	if auth != "" {
 		parts := strings.Fields(auth)
-		if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") && secureEqual(parts[1], a.token) {
-			return "bearer-ok"
+		if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
+			if secureEqual(parts[1], a.token) {
+				return "bearer-ok"
+			}
+			if isMCPPath(r.URL.Path) && a.mcpToken != "" && secureEqual(parts[1], a.mcpToken) {
+				return "mcp-bearer-ok"
+			}
 		}
 		return "invalid"
 	}
@@ -165,6 +227,10 @@ func (a *ControlAuth) classify(r *http.Request) string {
 		return "invalid"
 	}
 	return "missing"
+}
+
+func isMCPPath(path string) bool {
+	return path == "/mcp" || strings.HasPrefix(path, "/mcp/")
 }
 
 func secureEqual(got, want string) bool {
@@ -210,13 +276,16 @@ func (a *ControlAuth) handleBootstrap(w http.ResponseWriter, r *http.Request) {
 	valid := a.bootstrap != "" && secureEqual(code, a.bootstrap)
 	if valid {
 		a.bootstrap = ""
+		if err := a.mintBootstrap(); err != nil {
+			a.logger.Warn().Err(err).Msg("Could not mint the next bootstrap code")
+		}
 	}
 	a.mu.Unlock()
 	if !valid {
 		httpError(w, "bootstrap code is invalid or already used", http.StatusGone)
 		return
 	}
-	http.SetCookie(w, &http.Cookie{Name: ControlCookieName, Value: a.token, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode})
+	http.SetCookie(w, &http.Cookie{Name: ControlCookieName, Value: a.token, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: int(controlCookieAge.Seconds())})
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 
@@ -224,5 +293,9 @@ func (a *ControlAuth) Status() map[string]any {
 	if a == nil {
 		return map[string]any{"token_present": false, "mode": AuthModeAcceptAndLog}
 	}
-	return map[string]any{"token_present": a.token != "", "mode": AuthModeAcceptAndLog, "data_dir": a.dataDir}
+	mode := AuthModeAcceptAndLog
+	if a.enforce {
+		mode = AuthModeEnforce
+	}
+	return map[string]any{"token_present": a.token != "", "mode": mode, "data_dir": a.dataDir}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -29,6 +30,21 @@ type Options struct {
 	// HTTP API. Mutually exclusive with V2 (client mode never runs its own
 	// dispatcher).
 	Daemon *localapi.Client
+
+	// ReadOnly registers only the read, search and draft tools: nothing that
+	// sends, reacts, imports or rewrites a message. Also set by
+	// OPENMESSAGES_MCP_READ_ONLY=1 so an agent-facing deployment can't opt out.
+	ReadOnly bool
+}
+
+// readOnlyFromEnv reports whether OPENMESSAGES_MCP_READ_ONLY asks for the
+// read and draft only tool set.
+func readOnlyFromEnv() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("OPENMESSAGES_MCP_READ_ONLY"))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }
 
 func Register(s *server.MCPServer, a *app.App, v2 ...*V2Dependencies) {
@@ -61,6 +77,10 @@ func RegisterWithOptions(s *server.MCPServer, a *app.App, options Options) {
 	s.AddTool(getMessagesTool(), getMessagesHandler(a, options))
 	s.AddTool(getConversationTool(), getConversationHandler(a, options))
 	s.AddTool(searchMessagesTool(), searchMessagesHandler(a, options))
+	if options.ReadOnly || readOnlyFromEnv() {
+		registerReadOnly(s, a, options, v2Primary)
+		return
+	}
 	switch {
 	case options.Daemon != nil:
 		s.AddTool(sendMessageTool(true), daemonSendMessageHandler(options))
@@ -111,6 +131,26 @@ func RegisterWithOptions(s *server.MCPServer, a *app.App, options Options) {
 	default:
 		s.AddTool(sendGroupMessageTool(true), sendGroupMessageHandler(a, configuredV2))
 	}
+}
+
+// registerReadOnly adds the tools that only read the archive or save a draft
+// for the user to review and send from the app. The get/search tools are
+// registered by the caller.
+func registerReadOnly(s *server.MCPServer, a *app.App, options Options, v2Primary bool) {
+	s.AddTool(listConversationsTool(), listConversationsHandler(a, options))
+	s.AddTool(listContactsTool(), listContactsHandler(a))
+	s.AddTool(resolveContactRoutesTool(), resolveContactRoutesHandler(a))
+	if options.Daemon != nil {
+		s.AddTool(getStatusTool(), daemonGetStatusHandler(a, options))
+	} else {
+		s.AddTool(getStatusTool(), getStatusHandler(a, options))
+	}
+	s.AddTool(draftMessageTool(), draftMessageHandler(a))
+	s.AddTool(downloadMediaTool(), downloadMediaHandler(a, options))
+	s.AddTool(getPersonMessagesTool(), getPersonMessagesHandler(a, options))
+	s.AddTool(getPersonMessagesRangeTool(), getPersonMessagesRangeHandler(a, options))
+	s.AddTool(conversationStatsTool(), unavailableInV2Primary(v2Primary, conversationStatsHandler(a)))
+	s.AddTool(personStatsTool(), unavailableInV2Primary(v2Primary, personStatsHandler(a)))
 }
 
 // unavailableWhileV2Serving explains the gate on the stats/story/viz tools:

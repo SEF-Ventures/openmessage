@@ -227,3 +227,27 @@ func TestEventStreamRejectsNewestSubscriberAtLimit(t *testing.T) {
 		t.Fatalf("status = %d, want 503", w.Code)
 	}
 }
+
+func TestPublishBootstrapURLNeverWritesToLogStream(t *testing.T) {
+	dir := t.TempDir()
+	a, err := NewControlAuth(dir, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out strings.Builder
+	path, err := a.PublishBootstrapURL("http://127.0.0.1:7007", &out, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Len() != 0 || strings.Contains(path, a.bootstrap) {
+		t.Fatalf("non-terminal publish leaked to stream or path")
+	}
+	b, err := os.ReadFile(path)
+	if err != nil || !strings.Contains(string(b), a.bootstrap) {
+		t.Fatalf("bootstrap file missing code: %v", err)
+	}
+	var tty strings.Builder
+	if p, err := a.PublishBootstrapURL("http://127.0.0.1:7007", &tty, true); err != nil || p != "" || !strings.Contains(tty.String(), a.bootstrap) {
+		t.Fatalf("terminal publish wrong: %v", err)
+	}
+}

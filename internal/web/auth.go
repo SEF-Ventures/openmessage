@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -125,6 +126,32 @@ func (a *ControlAuth) BootstrapURL(baseURL string) string {
 		return ""
 	}
 	return strings.TrimRight(baseURL, "/") + "/auth/bootstrap?t=" + a.bootstrap
+}
+
+// BootstrapURLFile is written under the data dir when stderr is not a terminal.
+const BootstrapURLFile = "bootstrap.url"
+
+// PublishBootstrapURL hands the single-use bootstrap URL to the operator without
+// leaking it into service logs. On a terminal it prints to w; otherwise (journald,
+// docker logs, files) it writes the URL to a 0600 file in the data dir and returns
+// that path. The URL itself is never returned for logging.
+func (a *ControlAuth) PublishBootstrapURL(baseURL string, w io.Writer, isTerminal bool) (string, error) {
+	url := a.BootstrapURL(baseURL)
+	if url == "" {
+		return "", nil
+	}
+	if isTerminal {
+		_, err := fmt.Fprintf(w, "Open this single-use URL to authorize the web UI (it redirects without exposing the control token):\n%s\n", url)
+		return "", err
+	}
+	path := filepath.Join(a.dataDir, BootstrapURLFile)
+	if err := os.WriteFile(path, []byte(url+"\n"), 0o600); err != nil {
+		return "", fmt.Errorf("write bootstrap url file: %w", err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		return "", fmt.Errorf("secure bootstrap url file: %w", err)
+	}
+	return path, nil
 }
 
 func (a *ControlAuth) Handler(next http.Handler) http.Handler {

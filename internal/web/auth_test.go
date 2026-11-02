@@ -228,26 +228,53 @@ func TestEventStreamRejectsNewestSubscriberAtLimit(t *testing.T) {
 	}
 }
 
-func TestPublishBootstrapURLNeverWritesToLogStream(t *testing.T) {
+func TestPublishBootstrapURLWritesFileAndNeverReturnsCode(t *testing.T) {
 	dir := t.TempDir()
 	a, err := NewControlAuth(dir, zerolog.Nop())
 	if err != nil {
 		t.Fatal(err)
 	}
-	var out strings.Builder
-	path, err := a.PublishBootstrapURL("http://127.0.0.1:7007", &out, false)
+	// A pre-existing symlink at the destination must be replaced, not followed.
+	target := filepath.Join(t.TempDir(), "victim")
+	if err := os.Symlink(target, filepath.Join(dir, BootstrapURLFile)); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	path, err := a.PublishBootstrapURL("http://127.0.0.1:7007")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out.Len() != 0 || strings.Contains(path, a.bootstrap) {
-		t.Fatalf("non-terminal publish leaked to stream or path")
+	if strings.Contains(path, a.bootstrap) {
+		t.Fatalf("returned path contains the code")
 	}
 	b, err := os.ReadFile(path)
 	if err != nil || !strings.Contains(string(b), a.bootstrap) {
 		t.Fatalf("bootstrap file missing code: %v", err)
 	}
-	var tty strings.Builder
-	if p, err := a.PublishBootstrapURL("http://127.0.0.1:7007", &tty, true); err != nil || p != "" || !strings.Contains(tty.String(), a.bootstrap) {
-		t.Fatalf("terminal publish wrong: %v", err)
+	if _, err := os.Stat(target); err == nil {
+		t.Fatalf("symlink target was written")
+	}
+	if info, _ := os.Lstat(path); info.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("destination is still a symlink")
+	}
+}
+
+func TestBootstrapFileRemovedOnceCodeConsumed(t *testing.T) {
+	dir := t.TempDir()
+	a, err := NewControlAuth(dir, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := a.PublishBootstrapURL("http://127.0.0.1:7007")
+	if err != nil {
+		t.Fatal(err)
+	}
+	url := a.BootstrapURL("http://127.0.0.1:7007")
+	w := httptest.NewRecorder()
+	a.Handler(http.NotFoundHandler()).ServeHTTP(w, httptest.NewRequest(http.MethodGet, url, nil))
+	if w.Code != http.StatusFound {
+		t.Fatalf("status = %d", w.Code)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("bootstrap file still present: %v", err)
 	}
 }

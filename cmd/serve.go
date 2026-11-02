@@ -798,10 +798,10 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		go func() {
 			if opts.web {
 				logger.Info().Str("addr", listenAddr).Msg("Web UI available at " + baseURL)
-				if path, err := controlAuth.PublishBootstrapURL(baseURL, os.Stderr, term.IsTerminal(int(os.Stderr.Fd()))); err != nil {
+				if path, err := controlAuth.PublishBootstrapURL(baseURL); err != nil {
 					logger.Warn().Err(err).Msg("Could not publish the web UI bootstrap URL")
 				} else if path != "" {
-					logger.Info().Str("path", path).Msg("Single-use web UI bootstrap URL written to file (not logged)")
+					logger.Info().Str("path", path).Msg("Single-use web UI bootstrap URL written to file (never logged); read it from that file")
 				}
 			}
 			if opts.mcpSSE {

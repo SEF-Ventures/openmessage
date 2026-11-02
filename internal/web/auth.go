@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"os"
@@ -128,28 +127,39 @@ func (a *ControlAuth) BootstrapURL(baseURL string) string {
 	return strings.TrimRight(baseURL, "/") + "/auth/bootstrap?t=" + a.bootstrap
 }
 
-// BootstrapURLFile is written under the data dir when stderr is not a terminal.
+// BootstrapURLFile holds the single-use bootstrap URL under the data dir. The URL
+// is a credential, so it is never printed or logged in any mode, terminal or not.
 const BootstrapURLFile = "bootstrap.url"
 
-// PublishBootstrapURL hands the single-use bootstrap URL to the operator without
-// leaking it into service logs. On a terminal it prints to w; otherwise (journald,
-// docker logs, files) it writes the URL to a 0600 file in the data dir and returns
-// that path. The URL itself is never returned for logging.
-func (a *ControlAuth) PublishBootstrapURL(baseURL string, w io.Writer, isTerminal bool) (string, error) {
+// PublishBootstrapURL writes the single-use bootstrap URL to a new 0600 temp file
+// and atomically renames it into place, so a pre-existing file or symlink at the
+// destination is replaced rather than followed. It returns the file path, which is
+// safe to log. The file is removed once the code is consumed.
+func (a *ControlAuth) PublishBootstrapURL(baseURL string) (string, error) {
 	url := a.BootstrapURL(baseURL)
 	if url == "" {
 		return "", nil
 	}
-	if isTerminal {
-		_, err := fmt.Fprintf(w, "Open this single-use URL to authorize the web UI (it redirects without exposing the control token):\n%s\n", url)
-		return "", err
-	}
 	path := filepath.Join(a.dataDir, BootstrapURLFile)
-	if err := os.WriteFile(path, []byte(url+"\n"), 0o600); err != nil {
-		return "", fmt.Errorf("write bootstrap url file: %w", err)
+	f, err := os.CreateTemp(a.dataDir, ".bootstrap.url-*")
+	if err != nil {
+		return "", fmt.Errorf("create temporary bootstrap url file: %w", err)
 	}
-	if err := os.Chmod(path, 0o600); err != nil {
-		return "", fmt.Errorf("secure bootstrap url file: %w", err)
+	tempPath := f.Name()
+	defer os.Remove(tempPath)
+	if err = f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		return "", fmt.Errorf("secure temporary bootstrap url file: %w", err)
+	}
+	if _, err = f.WriteString(url + "\n"); err != nil {
+		_ = f.Close()
+		return "", fmt.Errorf("write temporary bootstrap url file: %w", err)
+	}
+	if err = f.Close(); err != nil {
+		return "", fmt.Errorf("close temporary bootstrap url file: %w", err)
+	}
+	if err = os.Rename(tempPath, path); err != nil {
+		return "", fmt.Errorf("install bootstrap url file: %w", err)
 	}
 	return path, nil
 }
@@ -237,6 +247,7 @@ func (a *ControlAuth) handleBootstrap(w http.ResponseWriter, r *http.Request) {
 	valid := a.bootstrap != "" && secureEqual(code, a.bootstrap)
 	if valid {
 		a.bootstrap = ""
+		_ = os.Remove(filepath.Join(a.dataDir, BootstrapURLFile))
 	}
 	a.mu.Unlock()
 	if !valid {

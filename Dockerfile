@@ -35,7 +35,7 @@ ENV OPENMESSAGES_DATA_DIR=/data \
     OPENMESSAGES_HOST=0.0.0.0 \
     OPENMESSAGES_PORT=7007
 
-VOLUME ["/data"]
+# Mount a persistent volume at /data.
 EXPOSE 7007
 
 # Default to running the server. Override with `pair`, `import`, etc.

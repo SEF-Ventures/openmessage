@@ -3058,6 +3058,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	// Origin/Referer closes that vector without affecting native app requests.
 	if opts.Auth != nil {
 		handler = opts.Auth.Handler(handler)
+		return opts.Auth.Enforce(handler)
 	}
 	return ProtectLocalControl(handler)
 }

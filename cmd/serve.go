@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -169,6 +170,9 @@ func Version() string {
 }
 
 func RunServe(logger zerolog.Logger, args ...string) error {
+	if os.Getenv("PAIR_HOLD") == "1" {
+		return pairHold(os.Stderr)
+	}
 	previousUmask := syscall.Umask(0o077)
 	defer syscall.Umask(previousUmask)
 
@@ -782,7 +786,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				SyncGoogleContacts:    a.SyncGoogleContacts,
 			})
 		} else {
-			httpHandler = web.ProtectLocalControl(controlAuth.Handler(mcpHTTPHandler))
+			httpHandler = controlAuth.Enforce(controlAuth.Handler(mcpHTTPHandler))
 		}
 
 		ln, err := net.Listen("tcp", listenAddr)
@@ -1221,4 +1225,19 @@ func installGooglePullCounter(a *app.App, v2Primary bool, stack *v2Stack) {
 		reads = v2read.New(stack.Store)
 	}
 	a.SetGoogleConversationCounter(func() (int, error) { return reads.ConversationCount("sms") })
+}
+
+// pairHold idles for headless pairing (PAIR_HOLD=1): no store, transport,
+// listener or session.json access. It blocks until SIGTERM/SIGINT.
+func pairHold(w io.Writer) error {
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGTERM, os.Interrupt)
+	defer signal.Stop(sig)
+	return pairHoldUntil(w, sig)
+}
+
+func pairHoldUntil(w io.Writer, stop <-chan os.Signal) error {
+	fmt.Fprintln(w, "PAIR_HOLD=1: idle for pairing; no transports or listeners started. Send SIGTERM to exit.")
+	<-stop
+	return nil
 }

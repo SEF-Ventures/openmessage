@@ -33,6 +33,30 @@ func (s *Source) ListConversations(limit int) ([]*db.Conversation, error) {
 	return mapped, nil
 }
 
+// ListConversationsPage is the offset-capable variant of ListConversations.
+func (s *Source) ListConversationsPage(limit, offset int) ([]*db.Conversation, error) {
+	if err := s.ready(); err != nil {
+		return nil, err
+	}
+	conversations, err := s.store.ListConversationsPageAllAccounts(limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	accounts, err := s.accountIndex()
+	if err != nil {
+		return nil, fmt.Errorf("page conversations: %w", err)
+	}
+	mapped := make([]*db.Conversation, 0, len(conversations))
+	for _, conversation := range conversations {
+		dto, err := s.mapConversation(conversation, accounts)
+		if err != nil {
+			return nil, err
+		}
+		mapped = append(mapped, dto)
+	}
+	return mapped, nil
+}
+
 // SearchConversationsByMetadata is the v2 counterpart of the legacy metadata
 // search: a bounded title/participant substring match in SQL, mapping only the
 // hits (at most limit) rather than the whole conversation list.

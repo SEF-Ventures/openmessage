@@ -868,7 +868,13 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 
 	mux.HandleFunc("/api/conversations", func(w http.ResponseWriter, r *http.Request) {
 		limit := queryIntClamped(r, "limit", 50, 500)
-		convos, err := reads.ListConversations(limit)
+		var convos []*db.Conversation
+		var err error
+		if r.URL.Query().Has("offset") {
+			convos, err = listConversationsPage(reads, limit, queryIntClamped(r, "offset", 0, 1<<30))
+		} else {
+			convos, err = reads.ListConversations(limit)
+		}
 		if err != nil {
 			httpError(w, "list conversations: "+err.Error(), 500)
 			return
@@ -3842,6 +3848,21 @@ func queryInt64(r *http.Request, key string, defaultVal int64) int64 {
 // falling back to def for missing/non-positive values. SQLite treats LIMIT -1
 // as "no limit", so an unclamped negative/zero limit would return the entire
 // table — an unbounded-response/DoS vector.
+// listConversationsPage serves /api/conversations?offset=N. Sources with a
+// native pager use it; others fall back to slicing a longer window.
+func listConversationsPage(reads readsource.ReadSource, limit, offset int) ([]*db.Conversation, error) {
+	if pager, ok := reads.(interface {
+		ListConversationsPage(limit, offset int) ([]*db.Conversation, error)
+	}); ok {
+		return pager.ListConversationsPage(limit, offset)
+	}
+	all, err := reads.ListConversations(limit + offset)
+	if err != nil || offset >= len(all) {
+		return nil, err
+	}
+	return all[offset:], nil
+}
+
 func queryIntClamped(r *http.Request, key string, def, max int) int {
 	n := queryInt(r, key, def)
 	if n <= 0 {

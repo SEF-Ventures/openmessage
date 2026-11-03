@@ -227,3 +227,54 @@ func TestEventStreamRejectsNewestSubscriberAtLimit(t *testing.T) {
 		t.Fatalf("status = %d, want 503", w.Code)
 	}
 }
+
+func TestPublishBootstrapURLWritesFileAndNeverReturnsCode(t *testing.T) {
+	dir := t.TempDir()
+	a, err := NewControlAuth(dir, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A pre-existing symlink at the destination must be replaced, not followed.
+	target := filepath.Join(t.TempDir(), "victim")
+	if err := os.Symlink(target, filepath.Join(dir, BootstrapURLFile)); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	path, err := a.PublishBootstrapURL("http://127.0.0.1:7007")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(path, a.bootstrap) {
+		t.Fatalf("returned path contains the code")
+	}
+	b, err := os.ReadFile(path)
+	if err != nil || !strings.Contains(string(b), a.bootstrap) {
+		t.Fatalf("bootstrap file missing code: %v", err)
+	}
+	if _, err := os.Stat(target); err == nil {
+		t.Fatalf("symlink target was written")
+	}
+	if info, _ := os.Lstat(path); info.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("destination is still a symlink")
+	}
+}
+
+func TestBootstrapFileRemovedOnceCodeConsumed(t *testing.T) {
+	dir := t.TempDir()
+	a, err := NewControlAuth(dir, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := a.PublishBootstrapURL("http://127.0.0.1:7007")
+	if err != nil {
+		t.Fatal(err)
+	}
+	url := a.BootstrapURL("http://127.0.0.1:7007")
+	w := httptest.NewRecorder()
+	a.Handler(http.NotFoundHandler()).ServeHTTP(w, httptest.NewRequest(http.MethodGet, url, nil))
+	if w.Code != http.StatusFound {
+		t.Fatalf("status = %d", w.Code)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("bootstrap file still present: %v", err)
+	}
+}

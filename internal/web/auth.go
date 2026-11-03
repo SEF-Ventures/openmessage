@@ -149,6 +149,43 @@ func (a *ControlAuth) BootstrapURL(baseURL string) string {
 	return strings.TrimRight(baseURL, "/") + "/auth/bootstrap?t=" + a.bootstrap
 }
 
+// BootstrapURLFile holds the single-use bootstrap URL under the data dir. The URL
+// is a credential, so it is never printed or logged in any mode, terminal or not.
+const BootstrapURLFile = "bootstrap.url"
+
+// PublishBootstrapURL writes the single-use bootstrap URL to a new 0600 temp file
+// and atomically renames it into place, so a pre-existing file or symlink at the
+// destination is replaced rather than followed. It returns the file path, which is
+// safe to log. The file is removed once the code is consumed.
+func (a *ControlAuth) PublishBootstrapURL(baseURL string) (string, error) {
+	url := a.BootstrapURL(baseURL)
+	if url == "" {
+		return "", nil
+	}
+	path := filepath.Join(a.dataDir, BootstrapURLFile)
+	f, err := os.CreateTemp(a.dataDir, ".bootstrap.url-*")
+	if err != nil {
+		return "", fmt.Errorf("create temporary bootstrap url file: %w", err)
+	}
+	tempPath := f.Name()
+	defer os.Remove(tempPath)
+	if err = f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		return "", fmt.Errorf("secure temporary bootstrap url file: %w", err)
+	}
+	if _, err = f.WriteString(url + "\n"); err != nil {
+		_ = f.Close()
+		return "", fmt.Errorf("write temporary bootstrap url file: %w", err)
+	}
+	if err = f.Close(); err != nil {
+		return "", fmt.Errorf("close temporary bootstrap url file: %w", err)
+	}
+	if err = os.Rename(tempPath, path); err != nil {
+		return "", fmt.Errorf("install bootstrap url file: %w", err)
+	}
+	return path, nil
+}
+
 func (a *ControlAuth) Handler(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/auth/bootstrap" {
@@ -259,6 +296,7 @@ func (a *ControlAuth) handleBootstrap(w http.ResponseWriter, r *http.Request) {
 	valid := a.bootstrap != "" && secureEqual(code, a.bootstrap)
 	if valid {
 		a.bootstrap = ""
+		_ = os.Remove(filepath.Join(a.dataDir, BootstrapURLFile))
 	}
 	a.mu.Unlock()
 	if !valid {

@@ -2959,3 +2959,21 @@ It sends nothing. Add `whatsapp` or `signal` to the comma-separated
 `LIVE_PLATFORMS` list only when that platform will receive a real frame within
 the test deadline; use `LIVE_GOOGLE_CONV`, `LIVE_WHATSAPP_CONV`, or
 `LIVE_SIGNAL_CONV` to override the expected self-thread remote ID.
+
+## Headless / Railway
+
+Everything here is opt-in via env; with none set, desktop behavior is unchanged.
+
+| Env var | Effect |
+| --- | --- |
+| `OPENMESSAGES_CONTROL_TOKEN` | 64 hex chars (32 bytes). Used as the control token instead of `<datadir>/control.token`; never written to disk. A malformed value fails startup (the value is not echoed). |
+| `OPENMESSAGES_REQUIRE_TOKEN=1` | Enforce the token on `/api/*` and `/mcp*`. A valid `Authorization: Bearer <token>` is accepted from any Host/Origin; a valid `om_control` cookie still needs loopback Host/Origin; anything else is 401 with no body. `/auth/bootstrap` stays loopback-only. The static UI and `/api/status` health check work with the Bearer token. |
+| `OPENMESSAGES_MCP_READ_ONLY=1` | MCP omits every write tool (`send_message`, `send_to_conversation`, `send_media_to_conversation`, `send_group_message`, `react_to_message`, `set_message_transcript`, `draft_message`, `download_media`, `import_messages`). This covers MCP only, not the web `/api/*` write routes; keep the service on the private network. |
+| `PAIR_HOLD=1` | `serve` starts no store, transport, supervisor or listener and does not touch `session.json`. It prints one idle line to stderr and blocks until SIGTERM/SIGINT (exit 0). |
+
+Pair flow: deploy with `PAIR_HOLD=1`, then `railway ssh -s openmessage`, run
+`openmessage pair --google-stdin` inside the container, unset `PAIR_HOLD`, and
+redeploy so `serve` starts on the saved session.
+
+Google cookies expire. On headless Linux there is no browser to refresh them,
+so an expired session needs a manual re-pair (set `PAIR_HOLD=1` again and repeat).

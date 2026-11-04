@@ -20,11 +20,18 @@ const (
 	ControlTokenFile     = "control.token"
 	ControlCookieName    = "om_control"
 	AuthModeAcceptAndLog = "accept-and-log"
+	AuthModeEnforce      = "enforce"
+
+	// EnvControlToken supplies the control token (64 hex chars) instead of
+	// <datadir>/control.token. EnvRequireToken=1 enforces it on protected paths.
+	EnvControlToken = "OPENMESSAGES_CONTROL_TOKEN"
+	EnvRequireToken = "OPENMESSAGES_REQUIRE_TOKEN"
 	maxWarnedRemotes     = 1024
 )
 
 type ControlAuth struct {
 	token             string
+	require           bool
 	bootstrap         string
 	logger            zerolog.Logger
 	dataDir           string
@@ -38,9 +45,24 @@ func NewControlAuth(dataDir string, logger zerolog.Logger) (*ControlAuth, error)
 	if err != nil {
 		return nil, fmt.Errorf("resolve data directory: %w", err)
 	}
-	token, regenerated, err := loadOrMintControlToken(absDataDir)
-	if err != nil {
-		return nil, err
+	var token string
+	regenerated := false
+	if envToken := strings.TrimSpace(os.Getenv(EnvControlToken)); envToken != "" {
+		// The env token overrides the file and is never written to disk.
+		if decoded, decodeErr := hex.DecodeString(envToken); decodeErr != nil || len(decoded) != 32 {
+			return nil, fmt.Errorf("%s must be 64 hex characters (32 bytes)", EnvControlToken)
+		}
+		token = envToken
+	} else {
+		var err error
+		token, regenerated, err = loadOrMintControlToken(absDataDir)
+		if err != nil {
+			return nil, err
+		}
+	}
+	require := os.Getenv(EnvRequireToken) == "1"
+	if require && token == "" {
+		return nil, fmt.Errorf("%s=1 requires a control token", EnvRequireToken)
 	}
 	if regenerated {
 		// Regeneration invalidates cookies containing the old token, which is
@@ -51,7 +73,7 @@ func NewControlAuth(dataDir string, logger zerolog.Logger) (*ControlAuth, error)
 	if err != nil {
 		return nil, fmt.Errorf("mint bootstrap code: %w", err)
 	}
-	return &ControlAuth{token: token, bootstrap: bootstrap, logger: logger, dataDir: absDataDir, warned: make(map[string]struct{})}, nil
+	return &ControlAuth{token: token, require: require, bootstrap: bootstrap, logger: logger, dataDir: absDataDir, warned: make(map[string]struct{})}, nil
 }
 
 func loadOrMintControlToken(dataDir string) (string, bool, error) {
@@ -174,7 +196,7 @@ func (a *ControlAuth) Handler(next http.Handler) http.Handler {
 			a.handleBootstrap(w, r)
 			return
 		}
-		if isProtectedLocalPath(r.URL.Path) {
+		if !a.require && isProtectedLocalPath(r.URL.Path) {
 			classification := a.classify(r)
 			fetchSite := strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))
 			if classification == "missing" || classification == "invalid" || (fetchSite != "" && fetchSite != "same-origin" && fetchSite != "same-site" && fetchSite != "none") {
@@ -182,6 +204,33 @@ func (a *ControlAuth) Handler(next http.Handler) http.Handler {
 			}
 		}
 		next.ServeHTTP(w, r)
+	})
+}
+
+// Enforce wraps next with the loopback guard. When OPENMESSAGES_REQUIRE_TOKEN=1
+// it also enforces the control token on protected paths: a valid Bearer token
+// is accepted from any Host/Origin; a valid om_control cookie must still pass
+// the loopback checks; everything else is 401 with no detail.
+func (a *ControlAuth) Enforce(next http.Handler) http.Handler {
+	guarded := ProtectLocalControl(next)
+	if a == nil || !a.require {
+		return guarded
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !isProtectedLocalPath(r.URL.Path) {
+			guarded.ServeHTTP(w, r)
+			return
+		}
+		switch a.classify(r) {
+		case "bearer-ok":
+			setSecurityHeaders(w)
+			w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
+			next.ServeHTTP(w, r)
+		case "cookie-ok":
+			guarded.ServeHTTP(w, r)
+		default:
+			w.WriteHeader(http.StatusUnauthorized)
+		}
 	})
 }
 
@@ -262,5 +311,9 @@ func (a *ControlAuth) Status() map[string]any {
 	if a == nil {
 		return map[string]any{"token_present": false, "mode": AuthModeAcceptAndLog}
 	}
-	return map[string]any{"token_present": a.token != "", "mode": AuthModeAcceptAndLog, "data_dir": a.dataDir}
+	mode := AuthModeAcceptAndLog
+	if a.require {
+		mode = AuthModeEnforce
+	}
+	return map[string]any{"token_present": a.token != "", "mode": mode, "data_dir": a.dataDir}
 }

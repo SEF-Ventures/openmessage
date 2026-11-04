@@ -310,6 +310,30 @@ func (s *Store) ListConversations(limit int) ([]*Conversation, error) {
 	return scanConversations(rows)
 }
 
+// ListConversationsPage returns one page of conversations in a stable order
+// (newest first, conversation_id tie-break). Unlike ListConversations it does
+// not append favorites outside the window, so successive pages cover every
+// row exactly once.
+func (s *Store) ListConversationsPage(limit, offset int) ([]*Conversation, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	rows, err := s.db.Query(`
+		SELECT `+conversationColumns+`
+		FROM conversations
+		ORDER BY last_message_ts DESC, conversation_id
+		LIMIT ? OFFSET ?
+	`, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanConversations(rows)
+}
+
 // ConversationCount returns the total number of conversations, optionally filtered by source platform.
 func (s *Store) ConversationCount(sourcePlatform string) (int, error) {
 	var count int

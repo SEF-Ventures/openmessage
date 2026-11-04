@@ -801,6 +801,31 @@ func (s *Store) ListConversationsByRecencyAllAccounts(limit int) ([]Conversation
 	return conversations, nil
 }
 
+// ListConversationsPageAllAccounts returns one page of conversations across
+// every account in the same order as ListConversationsByRecencyAllAccounts.
+func (s *Store) ListConversationsPageAllAccounts(limit, offset int) ([]Conversation, error) {
+	if limit <= 0 {
+		return []Conversation{}, nil
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	rows, err := s.db.QueryContext(
+		context.Background(),
+		"SELECT "+conversationColumns+` FROM conversations
+		 ORDER BY last_message_at_ms DESC, conversation_id
+		 LIMIT ? OFFSET ?`, limit, offset,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("page conversations across accounts: %w", err)
+	}
+	conversations, err := collectRows(rows, scanConversation)
+	if err != nil {
+		return nil, fmt.Errorf("page conversations across accounts: %w", err)
+	}
+	return conversations, nil
+}
+
 // SearchConversationsByName returns conversations whose title, or whose
 // participants' display names or canonical addresses, contain query as a
 // case-insensitive substring — newest first, at most limit rows. It is the

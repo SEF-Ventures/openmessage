@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -30,6 +31,12 @@ type Options struct {
 	// dispatcher).
 	Daemon *localapi.Client
 }
+
+// EnvMCPReadOnly=1 omits every write tool from MCP registration.
+const EnvMCPReadOnly = "OPENMESSAGES_MCP_READ_ONLY"
+
+// MCPReadOnly reports whether MCP write tools are disabled by environment.
+func MCPReadOnly() bool { return os.Getenv(EnvMCPReadOnly) == "1" }
 
 func Register(s *server.MCPServer, a *app.App, v2 ...*V2Dependencies) {
 	var configuredV2 *V2Dependencies
@@ -58,32 +65,35 @@ func RegisterWithOptions(s *server.MCPServer, a *app.App, options Options) {
 	options.V2Primary = v2Primary
 	options.V2 = configuredV2
 
+	readOnly := MCPReadOnly()
 	s.AddTool(getMessagesTool(), getMessagesHandler(a, options))
 	s.AddTool(getConversationTool(), getConversationHandler(a, options))
 	s.AddTool(searchMessagesTool(), searchMessagesHandler(a, options))
-	switch {
-	case options.Daemon != nil:
-		s.AddTool(sendMessageTool(true), daemonSendMessageHandler(options))
-		s.AddTool(sendToConversationTool(true), daemonSendToConversationHandler(options))
-		s.AddTool(sendMediaToConversationTool(true), daemonSendMediaToConversationHandler(options))
-	case configuredV2 == nil:
-		s.AddTool(sendMessageTool(), sendMessageHandler(a))
-		s.AddTool(sendToConversationTool(), sendToConversationHandler(a))
-		s.AddTool(sendMediaToConversationTool(), sendMediaToConversationHandler(a))
-	default:
-		s.AddTool(sendMessageTool(true), sendMessageHandler(a, configuredV2))
-		s.AddTool(sendToConversationTool(true), sendToConversationHandler(a, configuredV2))
-		s.AddTool(sendMediaToConversationTool(true), sendMediaToConversationHandler(a, configuredV2))
+	if !readOnly {
+		switch {
+		case options.Daemon != nil:
+			s.AddTool(sendMessageTool(true), daemonSendMessageHandler(options))
+			s.AddTool(sendToConversationTool(true), daemonSendToConversationHandler(options))
+			s.AddTool(sendMediaToConversationTool(true), daemonSendMediaToConversationHandler(options))
+		case configuredV2 == nil:
+			s.AddTool(sendMessageTool(), sendMessageHandler(a))
+			s.AddTool(sendToConversationTool(), sendToConversationHandler(a))
+			s.AddTool(sendMediaToConversationTool(), sendMediaToConversationHandler(a))
+		default:
+			s.AddTool(sendMessageTool(true), sendMessageHandler(a, configuredV2))
+			s.AddTool(sendToConversationTool(true), sendToConversationHandler(a, configuredV2))
+			s.AddTool(sendMediaToConversationTool(true), sendMediaToConversationHandler(a, configuredV2))
+		}
+		switch {
+		case options.Daemon != nil:
+			s.AddTool(reactToMessageTool(true), daemonReactToMessageHandler(options))
+		case v2Primary:
+			s.AddTool(reactToMessageTool(true), reactToMessageHandler(a, options))
+		default:
+			s.AddTool(reactToMessageTool(), reactToMessageHandler(a))
+		}
+		s.AddTool(setMessageTranscriptTool(), setMessageTranscriptHandler(a))
 	}
-	switch {
-	case options.Daemon != nil:
-		s.AddTool(reactToMessageTool(true), daemonReactToMessageHandler(options))
-	case v2Primary:
-		s.AddTool(reactToMessageTool(true), reactToMessageHandler(a, options))
-	default:
-		s.AddTool(reactToMessageTool(), reactToMessageHandler(a))
-	}
-	s.AddTool(setMessageTranscriptTool(), setMessageTranscriptHandler(a))
 	s.AddTool(listConversationsTool(), listConversationsHandler(a, options))
 	s.AddTool(listContactsTool(), listContactsHandler(a))
 	s.AddTool(resolveContactRoutesTool(), resolveContactRoutesHandler(a))
@@ -92,9 +102,11 @@ func RegisterWithOptions(s *server.MCPServer, a *app.App, options Options) {
 	} else {
 		s.AddTool(getStatusTool(), getStatusHandler(a, options))
 	}
-	s.AddTool(draftMessageTool(), draftMessageHandler(a))
-	s.AddTool(downloadMediaTool(), downloadMediaHandler(a, options))
-	s.AddTool(importMessagesTool(), importMessagesHandler(a))
+	if !readOnly {
+		s.AddTool(draftMessageTool(), draftMessageHandler(a))
+		s.AddTool(downloadMediaTool(), downloadMediaHandler(a, options))
+		s.AddTool(importMessagesTool(), importMessagesHandler(a))
+	}
 	s.AddTool(getPersonMessagesTool(), getPersonMessagesHandler(a, options))
 	s.AddTool(getPersonMessagesRangeTool(), getPersonMessagesRangeHandler(a, options))
 	s.AddTool(conversationStatsTool(), unavailableInV2Primary(v2Primary, conversationStatsHandler(a)))
@@ -103,13 +115,15 @@ func RegisterWithOptions(s *server.MCPServer, a *app.App, options Options) {
 	s.AddTool(generatePersonStoryTool(), unavailableInV2Primary(v2Primary, generatePersonStoryHandler(a)))
 	s.AddTool(generateVizTool(), unavailableInV2Primary(v2Primary, generateVizHandler(a)))
 	s.AddTool(renderStoryTool(), unavailableInV2Primary(v2Primary, renderStoryHandler(a)))
-	switch {
-	case options.Daemon != nil:
-		s.AddTool(sendGroupMessageTool(true), daemonSendGroupMessageHandler())
-	case configuredV2 == nil:
-		s.AddTool(sendGroupMessageTool(), sendGroupMessageHandler(a))
-	default:
-		s.AddTool(sendGroupMessageTool(true), sendGroupMessageHandler(a, configuredV2))
+	if !readOnly {
+		switch {
+		case options.Daemon != nil:
+			s.AddTool(sendGroupMessageTool(true), daemonSendGroupMessageHandler())
+		case configuredV2 == nil:
+			s.AddTool(sendGroupMessageTool(), sendGroupMessageHandler(a))
+		default:
+			s.AddTool(sendGroupMessageTool(true), sendGroupMessageHandler(a, configuredV2))
+		}
 	}
 }
 
